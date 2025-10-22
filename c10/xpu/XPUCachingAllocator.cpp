@@ -39,6 +39,7 @@ constexpr size_t kRoundLarge = 2097152;
 
 namespace {
 using stream_set = ska::flat_hash_set<xpu::XPUStream>;
+size_t gLastReservedPeak = 0;
 
 struct Block;
 typedef bool (*Comparison)(const Block*, const Block*);
@@ -192,20 +193,36 @@ class DeviceCachingAllocator {
 
     uint64_t ptr_val = reinterpret_cast<uint64_t>(block->ptr);
     
+    const char* apply_wa = getenv("ALLOC_DEBUG_APPLY_WA");    
+
+    
+    if (apply_wa) {
+      Block* candidate {nullptr};
+      
+      for (auto& candidate_block : pool.blocks) {      
         
-    Block* candidate {nullptr};
-    for (auto& candidate_block : pool.blocks) {
-      uint64_t candidate_prev_ptr_val = ((uint64_t)candidate_block->ptr + candidate_block->size);
-      uint64_t candidate_next_ptr_val = ((uint64_t)block->ptr + block->size);
-      if (candidate_prev_ptr_val == ptr_val) {
-        std::cout << "[!] Found to merge @" << std::hex << (uint64_t)candidate_block->ptr << " + " << (uint64_t)block->ptr << std::endl;
-        candidate_block->next = block;
-        block->prev = candidate_block;
-      }
-      if (candidate_next_ptr_val == ptr_val) {
-        std::cout << "[!] Found to merge @" << std::hex << (uint64_t)candidate_block->ptr << " + " << (uint64_t)block->ptr << std::endl;
-        candidate_block->prev = block;
-        block->next = candidate_block;
+        if ((block->prev == nullptr) && (block->next == nullptr)) {
+          // both sides are null, cannot merge
+          continue;
+        }
+
+        if (block->prev == nullptr) {
+          uint64_t candidate_prev_ptr_val = ((uint64_t)candidate_block->ptr + candidate_block->size);
+          if (candidate_prev_ptr_val == ptr_val) {
+            std::cout << "[!] Found to merge @" << std::hex << (uint64_t)candidate_block->ptr << " + " << (uint64_t)block->ptr << std::endl;
+            candidate_block->next = block;
+            block->prev = candidate_block;
+          }
+        }
+        
+        if (block->next == nullptr) {
+          uint64_t candidate_next_ptr_val = ((uint64_t)block->ptr + block->size);
+          if (candidate_next_ptr_val == ptr_val) {
+            std::cout << "[!] Found to merge @" << std::hex << (uint64_t)candidate_block->ptr << " + " << (uint64_t)block->ptr << std::endl;
+            candidate_block->prev = block;
+            block->next = candidate_block;
+          }
+        }
       }
     }
     
@@ -320,6 +337,7 @@ class DeviceCachingAllocator {
         xpu::get_raw_device(device),
         xpu::get_device_context());
     if (!ptr) {
+      std::cout << "[alloc_err] Ptr is null! size: " << size << std::endl; 
       return false;
     }
     p.block = new Block(device, p.queue(), size, p.pool, ptr);
@@ -327,8 +345,6 @@ class DeviceCachingAllocator {
 
     for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
       stats.reserved_bytes[stat_type].increase(size);
-      volatile uint32_t wait = 1;
-      volatile uint32_t hit_count = 3;
 
       if (stat_type == static_cast<size_t>(StatType::AGGREGATE)) {  
         std::lock_guard<std::mutex> lock0(print_mutex);
@@ -340,6 +356,11 @@ class DeviceCachingAllocator {
           << "allocated " << format_size(stats.allocated_bytes[stat_type].current) << ", "
           << std::endl;
 
+        std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[stat_type].peak) << ", "
+          << "active " << format_size(stats.active_bytes[stat_type].peak) << ", "
+          << "requested " << format_size(stats.requested_bytes[stat_type].peak) << ", "
+          << "allocated " << format_size(stats.allocated_bytes[stat_type].peak) << ", "
+          << std::endl;
         
         const char* debug_print = getenv("ALLOC_DEBUG_PRINT");
 
@@ -348,11 +369,6 @@ class DeviceCachingAllocator {
           << " peak " << stats.reserved_bytes[stat_type].peak << std::endl;
         }
           
-          // std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[stat_type].peak) << ", "
-          // << "active " << format_size(stats.active_bytes[stat_type].peak) << ", "
-          // << "requested " << format_size(stats.requested_bytes[stat_type].peak) << ", "
-          // << "allocated " << format_size(stats.allocated_bytes[stat_type].peak) << ", "
-          // << std::endl;
 
 
         const char* current_str = getenv("ALLOC_DEBUG_CURRENT");
@@ -361,41 +377,47 @@ class DeviceCachingAllocator {
         const char* torch_check = getenv("ALLOC_DEBUG_TORCH_CHECK");
         const char* dump_cache = getenv("ALLOC_DEBUG_DUMP_CACHE");
         const char* dump_active = getenv("ALLOC_DEBUG_DUMP_ACTIVE");
+        const char* dump_cache_always = getenv("ALLOC_DEBUG_DUMP_CACHE_ALWAYS");
+
+
+        if (dump_cache) {
+          // std::cout << "# # # Dumping cache blocks # # #" << std::endl;
+          // std::cout << "Small Blocks:" << std::endl;
+          // for (const auto& b : small_blocks.blocks) {
+          //   std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
+          //   << " size " << b->size << " / " << b->requested_size 
+          //   << std::endl;
+          // }
+
+          if (dump_cache_always || (gLastReservedPeak < stats.reserved_bytes[stat_type].current)) {
+            std::cout << "Large Blocks:" << std::endl;
+            for (const auto& b : large_blocks.blocks) {
+              std::cout << "    " << std::hex << (uint64_t)b->ptr << std::dec 
+              << " size " << b->size << " / " << b->requested_size  
+              << " prev:" << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
+              << " next:" << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
+              << std::endl;               
+            }
+            gLastReservedPeak = stats.reserved_bytes[stat_type].current;
+          }
+          
+          if (dump_active) {
+            std::cout << "Active Blocks:" << std::endl;
+            for (const auto& b: active_blocks) {
+              std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
+              << " size " << b->size << " / " << b->requested_size  
+              << " prev: 0x" << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
+              << " next: 0x" << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
+              << std::endl;                 
+            }
+          }
+        }
         
         if (current_str && peak_str) {
           size_t current = atol(current_str);
           size_t peak = atol(peak_str);
-          
-          
-          if (current ==  stats.reserved_bytes[stat_type].current && peak== stats.reserved_bytes[stat_type].peak) {
-            if (dump_cache) {
-              std::cout << "# # # Dumping cache blocks # # #" << std::endl;
-              // std::cout << "Small Blocks:" << std::endl;
-              // for (const auto& b : small_blocks.blocks) {
-              //   std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
-              //   << " size " << b->size << " / " << b->requested_size 
-              //   << std::endl;
-              // }
-              std::cout << "Large Blocks:" << std::endl;
-              for (const auto& b : large_blocks.blocks) {
-                std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
-                << " size " << b->size << " / " << b->requested_size  
-                << " prev:" << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
-                << " next:" << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
-                << std::endl;               
-              }
-              if (dump_active) {
-                std::cout << "Active Blocks:" << std::endl;
-                for (const auto& b: active_blocks) {
-                  std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
-                  << " size " << b->size << " / " << b->requested_size  
-                  << " prev: 0x" << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
-                  << " next: 0x" << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
-                  << std::endl;                 
-                }
-              }
-            }
-
+                
+          if (current ==  stats.reserved_bytes[stat_type].current && peak== stats.reserved_bytes[stat_type].peak) { 
             if (sig_int) {
               raise(SIGINT);
             } 
@@ -407,8 +429,6 @@ class DeviceCachingAllocator {
         }
         
       }
-
-
     });
     return true;
   }
