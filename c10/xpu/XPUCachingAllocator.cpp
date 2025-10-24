@@ -63,6 +63,8 @@ struct Block {
   Block* prev{nullptr}; // prev block if split from a larger allocation
   Block* next{nullptr}; // next block if split from a larger allocation
   int event_count{0}; // number of outstanding XPU events
+  std::set<void*> merged_block_ptrs;
+  bool holds_memory{false};
 
   Block(
       DeviceIndex device,
@@ -85,6 +87,29 @@ struct Block {
         stream_uses(),
         size(size),
         requested_size(0) {}
+
+  
+  void propagate_merged_ptr() {
+    if (nullptr == prev) {
+      /* Nothing to prop*/
+      return;
+    }
+
+    Block* first_block_in_chain = prev;
+
+    while (first_block_in_chain->prev != nullptr) {
+      first_block_in_chain = first_block_in_chain->prev;
+    }
+
+    for (void* block_ptr : merged_block_ptrs) {
+      first_block_in_chain->merged_block_ptrs.insert(block_ptr);
+    }
+
+    if (this->holds_memory) {
+      first_block_in_chain->merged_block_ptrs.insert(this->ptr);
+    }
+      // this->merged_block_ptrs.clear();
+  }
 
   bool is_split() const {
     return (prev != nullptr) || (next != nullptr);
@@ -160,14 +185,20 @@ class DeviceCachingAllocator {
       return 0;
     }
 
+
     TORCH_INTERNAL_ASSERT(dst->is_split() && src->is_split());
     if (dst->prev == src) { // [src dst]
+      dst->propagate_merged_ptr();
       dst->ptr = src->ptr;
+      dst->merged_block_ptrs = src->merged_block_ptrs;
       dst->prev = src->prev;
+      dst->holds_memory = src->holds_memory;
+      
       if (dst->prev) {
         dst->prev->next = dst;
       }
     } else { // [dst src]
+      src->propagate_merged_ptr();
       dst->next = src->next;
       if (dst->next) {
         dst->next->prev = dst;
@@ -177,6 +208,7 @@ class DeviceCachingAllocator {
     dst->size += subsumed_size;
     auto erased = pool.blocks.erase(src);
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(erased == 1);
+    
     delete src;
 
     return subsumed_size;
@@ -245,7 +277,7 @@ class DeviceCachingAllocator {
 
     {  
         std::lock_guard<std::mutex> lock0(print_mutex);
-        std::cout << "[free_block] 0x" << std::hex << ptr_val << std::dec 
+        std::cout << "[free_block] " << std::hex << ptr_val << std::dec 
         << " size " << block->size << " / " << block->requested_size <<  std::endl;
 
         std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].current) << ", "
@@ -341,6 +373,7 @@ class DeviceCachingAllocator {
       return false;
     }
     p.block = new Block(device, p.queue(), size, p.pool, ptr);
+    p.block->holds_memory = true;
     auto block = p.block;
 
     for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
@@ -348,7 +381,7 @@ class DeviceCachingAllocator {
 
       if (stat_type == static_cast<size_t>(StatType::AGGREGATE)) {  
         std::lock_guard<std::mutex> lock0(print_mutex);
-        std::cout << "[alloc_block] 0x" << std::hex << (uint64_t)ptr << std::dec << " size " << block->size << " / " << block->requested_size << std::endl;
+        std::cout << "[alloc_block] " << std::hex << (uint64_t)ptr << std::dec << " size " << block->size << " / " << block->requested_size << std::endl;
 
         std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[stat_type].current) << ", "
           << "active " << format_size(stats.active_bytes[stat_type].current) << ", "
@@ -384,7 +417,7 @@ class DeviceCachingAllocator {
           // std::cout << "# # # Dumping cache blocks # # #" << std::endl;
           // std::cout << "Small Blocks:" << std::endl;
           // for (const auto& b : small_blocks.blocks) {
-          //   std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
+          //   std::cout << "  " << std::hex << (uint64_t)b->ptr << std::dec 
           //   << " size " << b->size << " / " << b->requested_size 
           //   << std::endl;
           // }
@@ -404,10 +437,10 @@ class DeviceCachingAllocator {
           if (dump_active) {
             std::cout << "Active Blocks:" << std::endl;
             for (const auto& b: active_blocks) {
-              std::cout << "  0x" << std::hex << (uint64_t)b->ptr << std::dec 
+              std::cout << "  " << std::hex << (uint64_t)b->ptr << std::dec 
               << " size " << b->size << " / " << b->requested_size  
-              << " prev: 0x" << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
-              << " next: 0x" << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
+              << " prev: " << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
+              << " next: " << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
               << std::endl;                 
             }
           }
@@ -460,7 +493,14 @@ class DeviceCachingAllocator {
      */
     size_t size = block->size;
     uint64_t ptr_val = reinterpret_cast<uint64_t>(block->ptr);
+
     sycl::free(block->ptr, xpu::get_device_context());
+
+    for (void* merged_ptr : block->merged_block_ptrs) {
+      std::cout << "[!] Freeing merged " << std::hex << reinterpret_cast<uint64_t>(merged_ptr) << std::dec << std::endl;
+      sycl::free(merged_ptr, xpu::get_device_context());
+    }
+
     auto* pool = block->pool;
     pool->blocks.erase(block);
 
@@ -470,7 +510,7 @@ class DeviceCachingAllocator {
       stats.reserved_bytes[stat_type].decrease(block->size);
       if (stat_type == static_cast<size_t>(StatType::AGGREGATE)) {
         std::lock_guard<std::mutex> lock0(print_mutex);
-        std::cout << "[release_block] 0x" << std::hex << ptr_val << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        std::cout << "[release_block] " << std::hex << ptr_val << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
         std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[stat_type].current) << ", "
           << "active " << format_size(stats.active_bytes[stat_type].current) << ", "
           << "requested " << format_size(stats.requested_bytes[stat_type].current) << ", "
@@ -555,6 +595,11 @@ class DeviceCachingAllocator {
       remaining->prev = block;
       remaining->ptr = static_cast<char*>(remaining->ptr) + size;
       remaining->size -= size;
+
+      block->holds_memory = remaining->holds_memory;
+      remaining->holds_memory = false;
+
+
       bool inserted = pool->blocks.insert(remaining).second;
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
     }
@@ -572,7 +617,14 @@ class DeviceCachingAllocator {
 
     {
         std::lock_guard<std::mutex> lock0(print_mutex);
-        std::cout << "[alloc_found_block] 0x" << std::hex << (uint64_t)block->ptr << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        std::cout << "[alloc_found_block] " << std::hex << (uint64_t)block->ptr << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        if (remaining) {
+          std::cout << "[remaining] " << std::hex 
+          << (uint64_t)remaining->ptr << std::dec << " size " 
+          << remaining->size << " / " << remaining->requested_size 
+          << std::endl;
+        }
+        
         std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].current) << ", "
         << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].current) << ", "
         << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].current) << ", "
@@ -629,7 +681,7 @@ class DeviceCachingAllocator {
           (release_cached_blocks() && alloc_block(params, true));
     } else {
       std::lock_guard<std::mutex> lock0(print_mutex);
-      std::cout << "[alloc cache] 0x" << std::hex << (uint64_t)params.block->ptr << std::dec  
+      std::cout << "[alloc cache] " << std::hex << (uint64_t)params.block->ptr << std::dec  
         << " cache hit, size: " << alloc_size << " / " << size << std::endl;
       
     }
@@ -686,7 +738,7 @@ class DeviceCachingAllocator {
     
     {  
         std::lock_guard<std::mutex> lock0(print_mutex);
-        std::cout << "[free] 0x" << std::hex << (uint64_t)orig_block_ptr << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        std::cout << "[free] " << std::hex << (uint64_t)orig_block_ptr << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
         std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].current) << ", "
         << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].current) << ", "
         << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].current) << ", "
