@@ -7,11 +7,21 @@
 #include <set>
 #include <vector>
 
+#include <iostream>
+#include <thread>
+#include <cstdlib>
+#include <csignal>
+
+// #include <csi
+
 namespace c10::xpu::XPUCachingAllocator {
+
+
 
 using namespace c10::CachingAllocator;
 using namespace c10::CachingDeviceAllocator;
 
+size_t STAT_TYPE_AGGR = static_cast<size_t>(StatType::AGGREGATE);
 // newly allocated memory with 512-byte alignment.
 constexpr size_t kDeviceAlignment = 512;
 // all sizes are rounded to at least 512 bytes
@@ -22,18 +32,19 @@ constexpr size_t kSmallSize = 1048576;
 constexpr size_t kSmallBuffer = 2097152;
 // allocations between 1 and 10 MiB may use kLargeBuffer
 constexpr size_t kMinLargeAlloc = 10485760;
-// round up large allocations to 2 MiB
 constexpr size_t kRoundLarge = 2097152;
+// round up large allocations to 2 MiB
 
 namespace {
 using stream_set = ska::flat_hash_set<xpu::XPUStream>;
+size_t gLastReservedPeak = 0;
 
 struct Block;
 typedef bool (*Comparison)(const Block*, const Block*);
 bool BlockComparatorSize(const Block* a, const Block* b);
 
 struct BlockPool {
-  BlockPool(bool small) : blocks(BlockComparatorSize), is_small(small) {}
+  BlockPool(bool small) : blocks(BlockComparatorSize),  is_small(small) {}
   std::set<Block*, Comparison> blocks;
   const bool is_small;
 };
@@ -50,6 +61,8 @@ struct Block {
   Block* prev{nullptr}; // prev block if split from a larger allocation
   Block* next{nullptr}; // next block if split from a larger allocation
   int event_count{0}; // number of outstanding XPU events
+  std::set<void*> merged_block_ptrs;
+  bool holds_memory{false};
 
   Block(
       DeviceIndex device,
@@ -73,6 +86,29 @@ struct Block {
         size(size),
         requested_size(0) {}
 
+  
+  void propagate_merged_ptr() {
+    if (nullptr == prev) {
+      /* Nothing to prop*/
+      return;
+    }
+
+    Block* first_block_in_chain = prev;
+
+    while (first_block_in_chain->prev != nullptr) {
+      first_block_in_chain = first_block_in_chain->prev;
+    }
+
+    for (void* block_ptr : merged_block_ptrs) {
+      first_block_in_chain->merged_block_ptrs.insert(block_ptr);
+    }
+
+    if (this->holds_memory) {
+      first_block_in_chain->merged_block_ptrs.insert(this->ptr);
+    }
+      // this->merged_block_ptrs.clear();
+  }
+
   bool is_split() const {
     return (prev != nullptr) || (next != nullptr);
   }
@@ -86,6 +122,11 @@ bool BlockComparatorSize(const Block* a, const Block* b) {
   if (a->size != b->size) {
     return a->size < b->size;
   }
+  return reinterpret_cast<uintptr_t>(a->ptr) <
+      reinterpret_cast<uintptr_t>(b->ptr);
+}
+
+bool BlockComparatorPtr(const Block* a, const Block* b) {
   return reinterpret_cast<uintptr_t>(a->ptr) <
       reinterpret_cast<uintptr_t>(b->ptr);
 }
@@ -123,6 +164,8 @@ struct AllocParams {
 
 } // anonymous namespace
 
+std::mutex print_mutex;
+
 class DeviceCachingAllocator {
  private:
   mutable std::recursive_mutex mutex;
@@ -140,14 +183,20 @@ class DeviceCachingAllocator {
       return 0;
     }
 
+
     TORCH_INTERNAL_ASSERT(dst->is_split() && src->is_split());
     if (dst->prev == src) { // [src dst]
+      dst->propagate_merged_ptr();
       dst->ptr = src->ptr;
+      dst->merged_block_ptrs = src->merged_block_ptrs;
       dst->prev = src->prev;
+      dst->holds_memory = src->holds_memory;
+      
       if (dst->prev) {
         dst->prev->next = dst;
       }
     } else { // [dst src]
+      src->propagate_merged_ptr();
       dst->next = src->next;
       if (dst->next) {
         dst->next->prev = dst;
@@ -157,6 +206,7 @@ class DeviceCachingAllocator {
     dst->size += subsumed_size;
     auto erased = pool.blocks.erase(src);
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(erased == 1);
+    
     delete src;
 
     return subsumed_size;
@@ -170,6 +220,43 @@ class DeviceCachingAllocator {
     size_t original_block_size = block->size;
     size_t requested_size = block->requested_size;
     auto& pool = *block->pool;
+
+    uint64_t ptr_val = reinterpret_cast<uint64_t>(block->ptr);
+    
+    const char* apply_wa = getenv("ALLOC_DEBUG_APPLY_WA");    
+
+    
+    if (apply_wa) {
+      Block* candidate {nullptr};
+      
+      for (auto& candidate_block : pool.blocks) {      
+        
+        if ((block->prev == nullptr) && (block->next == nullptr)) {
+          // both sides are null, cannot merge
+          continue;
+        }
+
+        if (block->prev == nullptr) {
+          uint64_t candidate_prev_ptr_val = ((uint64_t)candidate_block->ptr + candidate_block->size);
+          if (candidate_prev_ptr_val == ptr_val) {
+            std::cout << "[!] Found to merge @" << std::hex << (uint64_t)candidate_block->ptr << " + " << (uint64_t)block->ptr << std::endl;
+            candidate_block->next = block;
+            block->prev = candidate_block;
+          }
+        }
+        
+        if (block->next == nullptr) {
+          uint64_t candidate_next_ptr_val = ((uint64_t)block->ptr + block->size);
+          if (candidate_next_ptr_val == ptr_val) {
+            std::cout << "[!] Found to merge @" << std::hex << (uint64_t)candidate_block->ptr << " + " << (uint64_t)block->ptr << std::endl;
+            candidate_block->prev = block;
+            block->next = candidate_block;
+          }
+        }
+      }
+    }
+    
+    
     const std::array<Block*, 2> merge_candidates = {block->prev, block->next};
     for (Block* merge_candidate : merge_candidates) {
       try_merge_blocks(block, merge_candidate, pool);
@@ -183,7 +270,26 @@ class DeviceCachingAllocator {
     for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
       stats.active_bytes[stat_type].decrease(original_block_size);
       stats.requested_bytes[stat_type].decrease(requested_size);
+      
     });
+
+    {  
+        std::lock_guard<std::mutex> lock0(print_mutex);
+        std::cout << "[free_block] " << std::hex << ptr_val << std::dec 
+        << " size " << block->size << " / " << block->requested_size <<  std::endl;
+
+        std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "allocated " << format_size(stats.allocated_bytes[STAT_TYPE_AGGR].current) << ", "
+        << std::endl;
+
+        // std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "allocated  " << format_size(stats.allocated_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << std::endl;
+    }
   }
 
   void process_events() {
@@ -261,11 +367,99 @@ class DeviceCachingAllocator {
         xpu::get_raw_device(device),
         xpu::get_device_context());
     if (!ptr) {
+      std::cout << "[alloc_err] Ptr is null! size: " << size << std::endl; 
       return false;
     }
     p.block = new Block(device, p.queue(), size, p.pool, ptr);
+    p.block->holds_memory = true;
+    auto block = p.block;
+
     for_each_selected_stat_type(p.stat_types, [&](size_t stat_type) {
       stats.reserved_bytes[stat_type].increase(size);
+
+      if (stat_type == static_cast<size_t>(StatType::AGGREGATE)) {  
+        std::lock_guard<std::mutex> lock0(print_mutex);
+        std::cout << "[alloc_block] " << std::hex << (uint64_t)ptr << std::dec << " size " << block->size << " / " << block->requested_size << std::endl;
+
+        std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[stat_type].current) << ", "
+          << "active " << format_size(stats.active_bytes[stat_type].current) << ", "
+          << "requested " << format_size(stats.requested_bytes[stat_type].current) << ", "
+          << "allocated " << format_size(stats.allocated_bytes[stat_type].current) << ", "
+          << std::endl;
+
+        std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[stat_type].peak) << ", "
+          << "active " << format_size(stats.active_bytes[stat_type].peak) << ", "
+          << "requested " << format_size(stats.requested_bytes[stat_type].peak) << ", "
+          << "allocated " << format_size(stats.allocated_bytes[stat_type].peak) << ", "
+          << std::endl;
+        
+        const char* debug_print = getenv("ALLOC_DEBUG_PRINT");
+
+        if (debug_print){ 
+          std::cout << "current " << stats.reserved_bytes[stat_type].current 
+          << " peak " << stats.reserved_bytes[stat_type].peak << std::endl;
+        }
+          
+
+
+        const char* current_str = getenv("ALLOC_DEBUG_CURRENT");
+        const char* peak_str = getenv("ALLOC_DEBUG_PEAK");
+        const char* sig_int = getenv("ALLOC_DEBUG_BREAK");
+        const char* torch_check = getenv("ALLOC_DEBUG_TORCH_CHECK");
+        const char* dump_cache = getenv("ALLOC_DEBUG_DUMP_CACHE");
+        const char* dump_active = getenv("ALLOC_DEBUG_DUMP_ACTIVE");
+        const char* dump_cache_always = getenv("ALLOC_DEBUG_DUMP_CACHE_ALWAYS");
+
+
+        if (dump_cache) {
+          // std::cout << "# # # Dumping cache blocks # # #" << std::endl;
+          // std::cout << "Small Blocks:" << std::endl;
+          // for (const auto& b : small_blocks.blocks) {
+          //   std::cout << "  " << std::hex << (uint64_t)b->ptr << std::dec 
+          //   << " size " << b->size << " / " << b->requested_size 
+          //   << std::endl;
+          // }
+
+          if (dump_cache_always || (gLastReservedPeak < stats.reserved_bytes[stat_type].current)) {
+            std::cout << "Large Blocks:" << std::endl;
+            for (const auto& b : large_blocks.blocks) {
+              std::cout << "    " << std::hex << (uint64_t)b->ptr << std::dec 
+              << " size " << b->size << " / " << b->requested_size  
+              << " prev:" << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
+              << " next:" << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
+              << std::endl;               
+            }
+            gLastReservedPeak = stats.reserved_bytes[stat_type].current;
+          }
+          
+          if (dump_active) {
+            std::cout << "Active Blocks:" << std::endl;
+            for (const auto& b: active_blocks) {
+              std::cout << "  " << std::hex << (uint64_t)b->ptr << std::dec 
+              << " size " << b->size << " / " << b->requested_size  
+              << " prev: " << std::hex << (uint64_t) ((b->prev) ?  b->prev->ptr : nullptr) << std::dec
+              << " next: " << std::hex << (uint64_t) ((b->next) ?  b->next->ptr : nullptr) << std::dec
+              << std::endl;                 
+            }
+          }
+        }
+        
+        if (current_str && peak_str) {
+          size_t current = atol(current_str);
+          size_t peak = atol(peak_str);
+                
+          if (current ==  stats.reserved_bytes[stat_type].current && peak== stats.reserved_bytes[stat_type].peak) { 
+            if (sig_int) {
+              raise(SIGINT);
+            } 
+            if (torch_check) {
+              TORCH_CHECK(false, "John McLane: Yippee ki yay!");
+            }
+
+          }
+        }
+        
+      }
     });
     return true;
   }
@@ -295,14 +489,41 @@ class DeviceCachingAllocator {
      * We have to do a device-level synchronization before free these blocks to
      * guarantee that all kernels can access to the blocks have finished.
      */
+    size_t size = block->size;
+    uint64_t ptr_val = reinterpret_cast<uint64_t>(block->ptr);
+
     sycl::free(block->ptr, xpu::get_device_context());
+
+    for (void* merged_ptr : block->merged_block_ptrs) {
+      std::cout << "[!] Freeing merged " << std::hex << reinterpret_cast<uint64_t>(merged_ptr) << std::dec << std::endl;
+      sycl::free(merged_ptr, xpu::get_device_context());
+    }
+
     auto* pool = block->pool;
     pool->blocks.erase(block);
+
 
     StatTypes stat_types = get_stat_types_for_pool(*pool);
     for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
       stats.reserved_bytes[stat_type].decrease(block->size);
+      if (stat_type == static_cast<size_t>(StatType::AGGREGATE)) {
+        std::lock_guard<std::mutex> lock0(print_mutex);
+        std::cout << "[release_block] " << std::hex << ptr_val << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[stat_type].current) << ", "
+          << "active " << format_size(stats.active_bytes[stat_type].current) << ", "
+          << "requested " << format_size(stats.requested_bytes[stat_type].current) << ", "
+          << "allocated " << format_size(stats.allocated_bytes[stat_type].current) << ", "
+          << std::endl;
+          
+          // std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[stat_type].peak) << ", "
+          // << "active " << format_size(stats.active_bytes[stat_type].peak) << ", "
+          // << "requested " << format_size(stats.requested_bytes[stat_type].peak) << ", "
+          // << "allocated " << format_size(stats.allocated_bytes[stat_type].peak) << ", "
+          // << std::endl;
+      }
     });
+
+    
 
     delete block;
   }
@@ -372,6 +593,11 @@ class DeviceCachingAllocator {
       remaining->prev = block;
       remaining->ptr = static_cast<char*>(remaining->ptr) + size;
       remaining->size -= size;
+
+      block->holds_memory = remaining->holds_memory;
+      remaining->holds_memory = false;
+
+
       bool inserted = pool->blocks.insert(remaining).second;
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
     }
@@ -384,8 +610,31 @@ class DeviceCachingAllocator {
     for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
       stats.allocated_bytes[stat_type].increase(block->size);
       stats.active_bytes[stat_type].increase(block->size);
-      stats.requested_bytes[stat_type].increase(block->requested_size);
+      stats.requested_bytes[stat_type].increase(block->requested_size);     
     });
+
+    {
+        std::lock_guard<std::mutex> lock0(print_mutex);
+        std::cout << "[alloc_found_block] " << std::hex << (uint64_t)block->ptr << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        if (remaining) {
+          std::cout << "[remaining] " << std::hex 
+          << (uint64_t)remaining->ptr << std::dec << " size " 
+          << remaining->size << " / " << remaining->requested_size 
+          << std::endl;
+        }
+        
+        std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "allocated " << format_size(stats.allocated_bytes[STAT_TYPE_AGGR].current)  << ", "
+        << std::endl;
+        
+        // std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "allocated " << format_size(stats.allocated_bytes[STAT_TYPE_AGGR].peak)  << ", "
+        // << std::endl;
+      }
 
     c10::reportMemoryUsageToProfiler(
         block->ptr,
@@ -428,6 +677,11 @@ class DeviceCachingAllocator {
     if (!block_found) {
       block_found = alloc_block(params, false) ||
           (release_cached_blocks() && alloc_block(params, true));
+    } else {
+      std::lock_guard<std::mutex> lock0(print_mutex);
+      std::cout << "[alloc cache] " << std::hex << (uint64_t)params.block->ptr << std::dec  
+        << " cache hit, size: " << alloc_size << " / " << size << std::endl;
+      
     }
     if (!block_found) {
       c10::xpu::DeviceProp device_prop;
@@ -476,13 +730,15 @@ class DeviceCachingAllocator {
           " is reserved by PyTorch but unallocated.",
           " Please use `empty_cache` to release all unoccupied cached memory.");
     }
-    bool split_remainder = should_split(params.block, params.size());
+    bool split_remainder = should_split(params.block, params.size()) && (params.block->size != orig_size);
     return alloc_found_block(std::move(params), orig_size, split_remainder);
   }
 
   void free(Block* block) {
     std::scoped_lock<std::recursive_mutex> lock(mutex);
     block->allocated = false;
+
+    
 
     auto orig_block_ptr = block->ptr;
     auto orig_block_size = block->size;
@@ -491,6 +747,22 @@ class DeviceCachingAllocator {
     for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
       stats.allocated_bytes[stat_type].decrease(block->size);
     });
+    
+    {  
+        std::lock_guard<std::mutex> lock0(print_mutex);
+        std::cout << "[free] " << std::hex << (uint64_t)orig_block_ptr << std::dec << " size " << block->size << " / " << block->requested_size  << std::endl;
+        std::cout << "[stats curr] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].current) << ", "
+        << "allocated " << format_size(stats.allocated_bytes[STAT_TYPE_AGGR].current) << ", "
+        << std::endl;
+
+        // std::cout << "[stats peak] " << "reserved " << format_size(stats.reserved_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "active " << format_size(stats.active_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "requested " << format_size(stats.requested_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << "allocated " << format_size(stats.allocated_bytes[STAT_TYPE_AGGR].peak) << ", "
+        // << std::endl;
+    }
 
     if (!block->stream_uses.empty()) {
       insert_events(block);
