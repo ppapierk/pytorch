@@ -65,7 +65,13 @@ set(TORCH_XPU_ARCH_LIST ${XPU_ARCH_FLAGS})
 # Ensure SYCL device code compiles with C++20 (matching CMAKE_CXX_STANDARD).
 # SYCL_FLAGS flows into SYCL_COMPILE_FLAGS in torch-xpu-ops' BuildFlags.cmake
 # and is passed directly to icpx on the device compilation command line.
-list(APPEND SYCL_FLAGS -std=c++20)
+# On Windows with clang-cl (MSVC-compatible mode), icx expects /std:c++20 or
+# -Qstd=c++20, not -std=c++20. Use MSVC syntax for consistency with host flags.
+if(WIN32)
+  list(APPEND SYCL_FLAGS /std:c++20)
+else()
+  list(APPEND SYCL_FLAGS -std=c++20)
+endif()
 
 # Ensure USE_XPU is enabled.
 string(APPEND XPU_HOST_CXX_FLAGS " -DUSE_XPU")
